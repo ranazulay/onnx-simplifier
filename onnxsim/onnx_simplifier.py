@@ -16,6 +16,10 @@ TensorShape = List[int]
 TensorShapes = Dict[Optional[str], TensorShape]
 
 
+class ONNXSimplifierException(Exception):
+    pass
+
+
 def add_features_to_output(m: onnx.ModelProto, nodes: List[onnx.NodeProto]) -> None:
     """
     Add features to output in pb, so that ONNX Runtime will output them.
@@ -112,11 +116,13 @@ def generate_rand_input(model, input_shapes: Optional[TensorShapes] = None):
     return inputs
 
 
-def get_constant_nodes(m: onnx.ModelProto) -> List[onnx.NodeProto]:
+def get_constant_nodes(m: onnx.ModelProto, keep_original_constant_nodes: bool) -> List[onnx.NodeProto]:
     const_nodes = []
     const_tensors = [x.name for x in m.graph.initializer]
-    const_tensors.extend([node.output[0]
-                          for node in m.graph.node if node.op_type == 'Constant'])
+
+    if not keep_original_constant_nodes:
+        const_tensors.extend([node.output[0] for node in m.graph.node if node.op_type == 'Constant'])
+
     # If one of the input of a node is produced (directly or indirectly) by nms,
     # we consider the output of this node doesn't have constant shape,
     # so we do not simplify a such node even if the node is Shape op
@@ -139,7 +145,6 @@ def forward(model, inputs=None, input_shapes: Optional[TensorShapes] = None) -> 
     if input_shapes is None:
         input_shapes = {}
     sess_options = rt.SessionOptions()
-    sess_options.graph_optimization_level = rt.GraphOptimizationLevel(0)
     sess_options.log_severity_level = 3
     sess = rt.InferenceSession(model.SerializeToString(), sess_options=sess_options, providers=['CPUExecutionProvider'])
     if inputs is None:
@@ -197,7 +202,19 @@ def eliminate_const_nodes(model: onnx.ModelProto, const_nodes: List[onnx.NodePro
     return model
 
 
-def optimize(model: onnx.ModelProto, skip_fuse_bn: bool) -> onnx.ModelProto:
+def get_default_optimizers_list():
+    optimizers_list = ['eliminate_deadend', 'eliminate_identity', 'eliminate_nop_dropout',
+                       'eliminate_nop_monotone_argmax', 'eliminate_nop_pad', 'extract_constant_to_initializer',
+                       'eliminate_unused_initializer', 'eliminate_nop_transpose', 'fuse_add_bias_into_conv',
+                       # https://github.com/daquexian/onnx-simplifier/issues/31
+                       # 'fuse_consecutive_concats',
+                       'fuse_consecutive_log_softmax', 'fuse_consecutive_reduce_unsqueeze', 'fuse_consecutive_squeezes',
+                       'fuse_consecutive_transposes', 'fuse_matmul_add_bias_into_gemm', 'fuse_pad_into_conv',
+                       'fuse_transpose_into_gemm']
+    return optimizers_list
+
+
+def optimize(model: onnx.ModelProto, optimizers_list: Optional[List[str]], skip_fuse_bn: bool) -> onnx.ModelProto:
     """
     :param model: The onnx model.
     :return: The optimized onnx model.
@@ -205,6 +222,8 @@ def optimize(model: onnx.ModelProto, skip_fuse_bn: bool) -> onnx.ModelProto:
     After simplifying, use this method to fold constants generated in previous step into initializer,
     and eliminate unused constants.
     """
+    if not optimizers_list:
+        optimizers_list = get_default_optimizers_list()
 
     # Due to a onnx bug, https://github.com/onnx/onnx/issues/2417, we need to add missing initializers into inputs
     onnx.checker.check_model(model)
@@ -212,16 +231,7 @@ def optimize(model: onnx.ModelProto, skip_fuse_bn: bool) -> onnx.ModelProto:
     model = add_initializers_into_inputs(model)
     onnx.helper.strip_doc_string(model)
     onnx.checker.check_model(model)
-    optimizers_list = ['eliminate_deadend', 'eliminate_identity', 'eliminate_nop_dropout',
-                                            'eliminate_nop_monotone_argmax', 'eliminate_nop_pad',
-                                            'extract_constant_to_initializer', 'eliminate_unused_initializer',
-                                            'eliminate_nop_transpose', 'fuse_add_bias_into_conv', 
-                                            # https://github.com/daquexian/onnx-simplifier/issues/31
-                                            # 'fuse_consecutive_concats',
-                                            'fuse_consecutive_log_softmax',
-                                            'fuse_consecutive_reduce_unsqueeze', 'fuse_consecutive_squeezes',
-                                            'fuse_consecutive_transposes', 'fuse_matmul_add_bias_into_gemm',
-                                            'fuse_pad_into_conv', 'fuse_transpose_into_gemm']
+
     if not skip_fuse_bn:
         optimizers_list.append('fuse_bn_into_conv')
 
@@ -291,31 +301,30 @@ def check_and_update_input_shapes(model: onnx.ModelProto, input_shapes: TensorSh
     return input_shapes
 
 
-def simplify(model: Union[str, onnx.ModelProto], check_n: int = 0, perform_optimization: bool = True,
-        skip_fuse_bn: bool = False, input_shapes: Optional[TensorShapes] = None) \
-        -> Tuple[onnx.ModelProto, bool]:
+def simplify(model: Union[str, onnx.ModelProto],
+             check_n: int = 0,
+             skip_fuse_bn: bool = False,
+             input_shapes: Optional[TensorShapes] = None,
+             optimizers_list: Optional[List[str]] = None,
+             keep_original_constant_nodes: bool = False) -> Tuple[onnx.ModelProto, bool]:
+
     if input_shapes is None:
         input_shapes = {}
     if type(model) == str:
         model = onnx.load(model)
+
     onnx.checker.check_model(model)
     model_ori = copy.deepcopy(model)
     model = onnx.shape_inference.infer_shapes(model)
 
     input_shapes = check_and_update_input_shapes(model, input_shapes)
-
-    if perform_optimization:
-        model = optimize(model, skip_fuse_bn)
-
-    const_nodes = get_constant_nodes(model)
+    model = optimize(model, optimizers_list, skip_fuse_bn)
+    const_nodes = get_constant_nodes(model, keep_original_constant_nodes)
     res = forward_for_node_outputs(model, const_nodes, input_shapes=input_shapes)
     const_nodes = clean_constant_nodes(const_nodes, res)
     model = eliminate_const_nodes(model, const_nodes, res)
     onnx.checker.check_model(model)
-
-    if perform_optimization:
-        model = optimize(model, skip_fuse_bn)
+    model = optimize(model, optimizers_list, skip_fuse_bn)
 
     check_ok = check(model_ori, model, check_n, input_shapes=input_shapes)
-
     return model, check_ok
