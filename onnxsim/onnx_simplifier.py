@@ -21,6 +21,10 @@ TensorShapes = Dict[str, TensorShape]
 TensorShapesWithOptionalKey = Dict[Optional[str], TensorShape]
 
 
+class ONNXSimplifierException(Exception):
+    pass
+
+
 def add_features_to_output(m: onnx.ModelProto, nodes: List[onnx.NodeProto]) -> None:
     """
     Add features to output in pb, so that ONNX Runtime will output them.
@@ -129,11 +133,13 @@ def is_non_deterministic_model(model: onnx.ModelProto) -> bool:
     return any([is_non_deterministic_node(node) for node in model.graph.node])
 
 
-def get_constant_nodes(m: onnx.ModelProto, dynamic_input_shape: bool = False) -> List[onnx.NodeProto]:
+def get_constant_nodes(m: onnx.ModelProto, keep_original_constant_nodes: bool,
+                       dynamic_input_shape: bool = False) -> List[onnx.NodeProto]:
     const_nodes = []
     const_tensors = [x.name for x in m.graph.initializer]
-    const_tensors.extend([node.output[0]
-                          for node in m.graph.node if node.op_type == 'Constant'])
+    
+    if not keep_original_constant_nodes:
+        const_tensors.extend([node.output[0] for node in m.graph.node if node.op_type == 'Constant'])
 
     # The output shape of some node types is determined by the input value
     # we consider the output of this node doesn't have constant shape,
@@ -192,7 +198,6 @@ def forward(model,
         else:
             print("No such file '{}'".format(custom_lib), file=sys.stderr)
             exit(1)
-    sess_options.graph_optimization_level = rt.GraphOptimizationLevel(0)
     sess_options.log_severity_level = 3
     sess = rt.InferenceSession(model.SerializeToString(
     ), sess_options=sess_options, providers=['CPUExecutionProvider'])
@@ -269,7 +274,20 @@ def eliminate_const_nodes(model: onnx.ModelProto, const_nodes: List[onnx.NodePro
     return model
 
 
-def optimize(model: onnx.ModelProto, skip_fuse_bn: bool, skipped_optimizers: Optional[Sequence[str]]) -> onnx.ModelProto:
+def get_default_optimizers_list():
+    optimizers_list = ['eliminate_deadend', 'eliminate_identity', 'eliminate_nop_dropout',
+                       'eliminate_nop_monotone_argmax', 'eliminate_nop_pad', 'extract_constant_to_initializer',
+                       'eliminate_unused_initializer', 'eliminate_nop_transpose', 'fuse_add_bias_into_conv',
+                       # https://github.com/daquexian/onnx-simplifier/issues/31
+                       # 'fuse_consecutive_concats',
+                       'fuse_consecutive_log_softmax', 'fuse_consecutive_reduce_unsqueeze', 'fuse_consecutive_squeezes',
+                       'fuse_consecutive_transposes', 'fuse_matmul_add_bias_into_gemm', 'fuse_pad_into_conv',
+                       'fuse_transpose_into_gemm']
+    return optimizers_list
+
+
+def optimize(model: onnx.ModelProto, optimizers_list: Optional[List[str]], skip_fuse_bn: bool,
+             skipped_optimizers: Optional[Sequence[str]]) -> onnx.ModelProto:
     """
     :param model: The onnx model.
     :return: The optimized onnx model.
@@ -277,11 +295,12 @@ def optimize(model: onnx.ModelProto, skip_fuse_bn: bool, skipped_optimizers: Opt
     After simplifying, use this method to fold constants generated in previous step into initializer,
     and eliminate unused constants.
     """
+    if not optimizers_list:
+        optimizers_list = get_default_optimizers_list()
 
     onnx.checker.check_model(model)
     onnx.helper.strip_doc_string(model)
-    optimizers_list = onnxoptimizer.get_fuse_and_elimination_passes()
-    if skip_fuse_bn:
+    if skip_fuse_bn and 'fuse_bn_into_conv' in optimizers_list:
         optimizers_list.remove('fuse_bn_into_conv')
     if skipped_optimizers is not None:
         for opt in skipped_optimizers:
@@ -407,9 +426,10 @@ def fixed_point(x: T, func_a: Callable[[T], T], func_b: Callable[[T], T]) -> T:
 
 def simplify(model: Union[str, onnx.ModelProto],
              check_n: int = 0,
-             perform_optimization: bool = True,
              skip_fuse_bn: bool = False,
              input_shapes: Optional[TensorShapesWithOptionalKey] = None,
+             optimizers_list: Optional[List[str]] = None,
+             keep_original_constant_nodes: bool = False,
              skipped_optimizers: Optional[Sequence[str]] = None,
              skip_shape_inference=False,
              input_data: Optional[Tensors] = None,
@@ -418,10 +438,11 @@ def simplify(model: Union[str, onnx.ModelProto],
     """
     :param model: onnx ModelProto object or file path
     :param check_n: The simplified model will be checked for `check_n` times by random inputs
-    :param perform_optimization: Whether to run onnx optimizer on the model
     :param skip_fuse_bn: Skip fuse_bn_into_conv onnx optimizer
     :param input_shapes: If the model has dynamic input shape, user must pass a fixed input shape 
             for generating random inputs and checking equality. (Also see "dynamic_input_shape" param)
+    :param optimizer_list: List of optimizers to run
+    :param keep_original_constant_nodes: Should keep original constant nodes
     :param skipped_optimizers: Skip some specific onnx optimizers
     :param skip_shape_inference: Skip shape inference (sometimes shape inference will crash)
     :param input_data: Feed custom input data for checking if needed
@@ -470,15 +491,14 @@ def simplify(model: Union[str, onnx.ModelProto],
             return model
 
         def optimize_if_applicable(model: onnx.ModelProto) -> onnx.ModelProto:
-            if perform_optimization:
-                model = optimize(model, skip_fuse_bn, skipped_optimizers)
+            model = optimize(model, optimizers_list, skip_fuse_bn, skipped_optimizers)
             return model
 
         return fixed_point(model, infer_shapes_if_applicable, optimize_if_applicable)
 
     def constant_folding(model: onnx.ModelProto) -> onnx.ModelProto:
         const_nodes = get_constant_nodes(
-            model, dynamic_input_shape=dynamic_input_shape)
+            model, keep_original_constant_nodes, dynamic_input_shape=dynamic_input_shape)
         res = forward_for_node_outputs(model,
                                        const_nodes,
                                        input_shapes=updated_input_shapes,
